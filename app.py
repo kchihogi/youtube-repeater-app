@@ -7,6 +7,7 @@ import tempfile
 import shutil
 import winreg
 import psutil
+import time  # timeモジュールを追加
 import tkinter as tk
 import tkinter.messagebox as messagebox
 import requests
@@ -32,7 +33,8 @@ def load_config():
         "repeat_time": 10,
         "time_unit": "分",
         "repeat_count": 1,
-        "infinite_loop": True
+        "infinite_loop": True,
+        "use_incognito": False  # シークレットモードのデフォルト設定を追加
     }
 
 
@@ -69,21 +71,18 @@ def kill_process_tree(pid):
         parent = psutil.Process(pid)
         children = parent.children(recursive=True)
         
-        # 子プロセスを終了
-        for child in children:
+        # すべてのプロセスを終了リストに入れる
+        processes = children + [parent]
+        
+        # まずは優しく終了要求
+        for p in processes:
             try:
-                child.terminate()
+                p.terminate()
             except:
                 pass
                 
-        # 親プロセスを終了
-        try:
-            parent.terminate()
-        except:
-            pass
-            
-        # 終了を待機（短時間）
-        gone, alive = psutil.wait_procs(children + [parent], timeout=3)
+        # 短い待機
+        _, alive = psutil.wait_procs(processes, timeout=2)
         
         # 残っているプロセスを強制終了
         for p in alive:
@@ -91,6 +90,11 @@ def kill_process_tree(pid):
                 p.kill()
             except:
                 pass
+                
+        # 最終確認（特にシークレットモード用）
+        _, still_alive = psutil.wait_procs(processes, timeout=1)
+        if still_alive:
+            print(f"警告: {len(still_alive)}個のプロセスが終了しませんでした")
     except Exception as e:
         print(f"プロセス終了エラー: {e}")
 
@@ -158,6 +162,10 @@ class App:
         self.infinite_var = tk.BooleanVar(value=self.config.get("infinite_loop", True))
         tk.Checkbutton(root, text="無限繰り返し", variable=self.infinite_var,
                       command=self.toggle_infinite).grid(row=2, column=2)
+        
+        # シークレットモードのオプションを追加
+        self.incognito_var = tk.BooleanVar(value=self.config.get("use_incognito", False))
+        tk.Checkbutton(root, text="シークレットモード", variable=self.incognito_var).grid(row=2, column=3)
         
         # 無限繰り返しの状態に合わせて回数入力欄の状態を設定
         if self.infinite_var.get():
@@ -280,6 +288,17 @@ class App:
             # 一時ディレクトリを作成（Chromeのユーザーデータ用）
             temp_dir = tempfile.mkdtemp(prefix="youtube_repeater_")
             
+            # 起動前の既存Chromeプロセスのリストを記録
+            existing_chrome_pids = set()
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    if 'chrome.exe' in proc.info['name'].lower():
+                        existing_chrome_pids.add(proc.info['pid'])
+                except:
+                    pass
+                
+            print(f"既存のChromeプロセス数: {len(existing_chrome_pids)}")
+            
             while not self.stop_event.is_set() and (count is None or iteration < count):
                 # ネットワーク接続確認
                 try:
@@ -302,13 +321,23 @@ class App:
                     CHROME_PATH,
                     "--new-window",
                     "--autoplay-policy=no-user-gesture-required",
-                    f"--user-data-dir={temp_dir}",
+                ]
+                
+                # シークレットモードが有効なら追加
+                if self.incognito_var.get():
+                    cmd.append("--incognito")
+                else:
+                    # シークレットモードでない場合はユーザーデータディレクトリを指定
+                    cmd.append(f"--user-data-dir={temp_dir}")
+            
+                # 共通のオプションを追加
+                cmd.extend([
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--disable-sync",
                     "--disable-extensions",
                     play_url
-                ]
+                ])
                 
                 try:
                     # 前回のプロセスが残っていれば終了
@@ -338,20 +367,37 @@ class App:
                 # Chromeプロセスを確実に終了
                 if chrome_proc and chrome_proc.poll() is None:
                     try:
-                        kill_process_tree(chrome_proc.pid)
-                        # 終了を確認
-                        chrome_proc.wait(timeout=5)
+                        # シークレットモードでは終了処理を強化
+                        if self.incognito_var.get():
+                            print(f"シークレットモードのChromeプロセス(PID:{chrome_proc.pid})を終了中...")
+                        
+                            # 改良された強制終了処理を実行（既存プロセスは保護）
+                            kill_chrome_processes(chrome_proc.pid, existing_chrome_pids)
+                        else:
+                            # 通常モードの場合は従来通り
+                            kill_process_tree(chrome_proc.pid)
                     except Exception as e:
                         print(f"プロセス終了エラー: {e}")
             
-                iteration += 1
+            # イテレーション間で確実にChromeが終了していることを確認
+            time.sleep(2)
+            # 既存プロセスを保護しつつクリーンアップ
+            kill_chrome_processes(None, existing_chrome_pids)
+                
+            iteration += 1
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("予期せぬエラー", f"実行中に予期せぬエラーが発生しました:\n{e}"))
         finally:
             # 最終的にChromeプロセスを確実に終了
             if chrome_proc and chrome_proc.poll() is None:
                 try:
-                    kill_process_tree(chrome_proc.pid)
+                    if self.incognito_var.get():
+                        kill_chrome_processes(chrome_proc.pid)
+                        # 最終手段としてtaskkillコマンドを使用
+                        subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe', '/T'], 
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        kill_process_tree(chrome_proc.pid)
                 except:
                     pass
         
@@ -383,15 +429,16 @@ class App:
             self.config["repeat_time"] = float(self.spin_time.get())
         except ValueError:
             self.config["repeat_time"] = 5  # デフォルト値
-    
+
         self.config["time_unit"] = self.unit_var.get()
         
         try:
             self.config["repeat_count"] = int(self.spin_count.get())
         except ValueError:
             self.config["repeat_count"] = 1  # デフォルト値
-    
+
         self.config["infinite_loop"] = self.infinite_var.get()
+        self.config["use_incognito"] = self.incognito_var.get()  # シークレットモード設定を保存
         
         # 設定を保存
         save_config(self.config)
@@ -409,6 +456,10 @@ class App:
             elif res is None:
                 self.config["skip_shortcut_prompt"] = True
                 save_config(self.config)
+        
+        # 終了前に残っているChromeプロセスをすべて終了
+        self.cleanup_chrome()
+    
         self.stop_event.set()
         self.root.destroy()
 
@@ -416,8 +467,97 @@ class App:
         """停止ボタンがクリックされたときの処理"""
         self.stop_event.set()
         self.btn_stop.config(state="disabled")
-        # 停止中の表示
         self.label_timer.config(text="停止中...")
+        
+        # すべてのChromeプロセスを強制終了
+        threading.Thread(target=lambda: self.cleanup_chrome(), daemon=True).start()
+
+    def cleanup_chrome(self):
+        """アプリが起動したChromeプロセスのみを終了"""
+        print("Chromeの終了処理を開始...")
+        
+        # 既存の全Chromeプロセスを記録（これらは終了しない）
+        existing_chrome_pids = set()
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                if 'chrome.exe' in proc.info['name'].lower():
+                    existing_chrome_pids.add(proc.info['pid'])
+            except:
+                pass
+    
+        # 明示的にアプリが起動したChromeプロセスのみを終了
+        kill_chrome_processes(None, set())  # 空のセットを渡すと、全てのプロセスが対象になる
+    
+        print("Chrome終了処理が完了しました")
+
+def kill_chrome_processes(proc_pid=None, existing_pids=None):
+    """Chromeの関連プロセスを選択的に終了させる（ユーザーのウィンドウを保護）"""
+    try:
+        if existing_pids is None:
+            existing_pids = set()
+            
+        print(f"Chrome終了処理開始: 対象PID={proc_pid}, 保護対象プロセス数={len(existing_pids)}")
+        
+        # 特定のPIDが指定されている場合、そのプロセスとその子プロセスのみを終了
+        if proc_pid and psutil.pid_exists(proc_pid):
+            try:
+                # 指定されたプロセスを終了
+                parent = psutil.Process(proc_pid)
+                
+                # 子プロセスを取得
+                children = parent.children(recursive=True)
+                
+                # 終了すべきプロセスのリスト（既存プロセスは除外）
+                target_processes = []
+                for p in [parent] + children:
+                    if p.pid not in existing_pids:
+                        target_processes.append(p)
+                
+                print(f"終了対象プロセス数: {len(target_processes)}")
+                
+                # プロセスを終了
+                for p in target_processes:
+                    try:
+                        p.terminate()
+                    except:
+                        pass
+                
+                # 少し待機
+                _, alive = psutil.wait_procs(target_processes, timeout=2)
+                
+                # 残っているプロセスを強制終了
+                for p in alive:
+                    try:
+                        p.kill()
+                    except:
+                        pass
+            except Exception as e:
+                print(f"プロセス終了エラー: {e}")
+        else:
+            # 新規に作成されたChromeプロセスを検索（既存プロセスは保護）
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    # Chromeプロセスを特定
+                    if 'chrome.exe' in proc.info['name'].lower():
+                        # 既存プロセスリストにないもの、かつインコグニトフラグがあるものを終了
+                        if (proc.pid not in existing_pids and 
+                            proc.info.get('cmdline') and 
+                            '--incognito' in ' '.join(proc.info.get('cmdline', []))):
+                            print(f"インコグニトプロセスを終了: PID={proc.pid}")
+                            try:
+                                proc.terminate()
+                                try:
+                                    proc.wait(timeout=1)
+                                except:
+                                    proc.kill()
+                            except:
+                                pass
+                except:
+                    pass
+                    
+        print("Chrome終了処理が完了しました")
+    except Exception as e:
+        print(f"Chrome終了エラー: {e}")
 
 if __name__ == "__main__":
     CHROME_PATH = get_chrome_path()
