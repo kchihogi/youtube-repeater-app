@@ -3,6 +3,8 @@ import sys
 import json
 import threading
 import subprocess
+import tempfile
+import shutil
 import winreg
 import psutil
 import tkinter as tk
@@ -62,20 +64,35 @@ def get_chrome_path():
 
 
 def kill_process_tree(pid):
+    """プロセスとその子プロセスを強制終了する（改良版）"""
     try:
-        p = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        return
-    for c in p.children(recursive=True):
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+        
+        # 子プロセスを終了
+        for child in children:
+            try:
+                child.terminate()
+            except:
+                pass
+                
+        # 親プロセスを終了
         try:
-            c.kill()
-        except Exception:
+            parent.terminate()
+        except:
             pass
-    try:
-        p.kill()
-    except Exception:
-        pass
-
+            
+        # 終了を待機（短時間）
+        gone, alive = psutil.wait_procs(children + [parent], timeout=3)
+        
+        # 残っているプロセスを強制終了
+        for p in alive:
+            try:
+                p.kill()
+            except:
+                pass
+    except Exception as e:
+        print(f"プロセス終了エラー: {e}")
 
 def create_desktop_shortcut():
     try:
@@ -256,7 +273,13 @@ class App:
 
     def run_loop(self, url, interval, count):
         iteration = 0
+        chrome_proc = None
+        temp_dir = None
+        
         try:
+            # 一時ディレクトリを作成（Chromeのユーザーデータ用）
+            temp_dir = tempfile.mkdtemp(prefix="youtube_repeater_")
+            
             while not self.stop_event.is_set() and (count is None or iteration < count):
                 # ネットワーク接続確認
                 try:
@@ -273,12 +296,26 @@ class App:
                 if 'youtube.com/watch' in url:
                     sep = '&' if '?' in url else '?'
                     play_url = f"{url}{sep}autoplay=1"
-                cmd = [CHROME_PATH,
-                       "--new-window",
-                       "--autoplay-policy=no-user-gesture-required",
-                       play_url]
+            
+                # 独立したChromeインスタンスとして起動
+                cmd = [
+                    CHROME_PATH,
+                    "--new-window",
+                    "--autoplay-policy=no-user-gesture-required",
+                    f"--user-data-dir={temp_dir}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-sync",
+                    "--disable-extensions",
+                    play_url
+                ]
+                
                 try:
-                    proc = subprocess.Popen(cmd)
+                    # 前回のプロセスが残っていれば終了
+                    if chrome_proc and chrome_proc.poll() is None:
+                        kill_process_tree(chrome_proc.pid)
+                    
+                    chrome_proc = subprocess.Popen(cmd)
                 except FileNotFoundError:
                     self.root.after(0, lambda: messagebox.showerror("ブラウザエラー", 
                         "Chromeが見つかりません。パスが正しいか確認してください。"))
@@ -298,14 +335,33 @@ class App:
                         break
                     remaining -= 1
 
-                try:
-                    kill_process_tree(proc.pid)
-                except Exception as e:
-                    print(f"プロセス終了エラー: {e}")
+                # Chromeプロセスを確実に終了
+                if chrome_proc and chrome_proc.poll() is None:
+                    try:
+                        kill_process_tree(chrome_proc.pid)
+                        # 終了を確認
+                        chrome_proc.wait(timeout=5)
+                    except Exception as e:
+                        print(f"プロセス終了エラー: {e}")
+            
                 iteration += 1
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("予期せぬエラー", f"実行中に予期せぬエラーが発生しました:\n{e}"))
         finally:
+            # 最終的にChromeプロセスを確実に終了
+            if chrome_proc and chrome_proc.poll() is None:
+                try:
+                    kill_process_tree(chrome_proc.pid)
+                except:
+                    pass
+        
+            # 一時ディレクトリを削除
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except:
+                    pass
+                
             self.root.after(0, lambda: self.btn_start.config(state="normal"))
             self.root.after(0, lambda: self.btn_stop.config(state="disabled"))
             self.root.after(0, lambda: self.label_timer.config(text="--:--:--"))
