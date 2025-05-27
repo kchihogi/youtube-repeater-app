@@ -25,7 +25,7 @@ jobs:
         if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
     - name: Build with PyInstaller
-      run: pyinstaller --onefile app.py --distpath dist --name YoutubeRepeater
+      run: pyinstaller --onefile --icon=app.ico --add-data "app.ico;." app.py --distpath dist --name YoutubeRepeater
 
     - name: Upload EXE as Artifact
       uses: actions/upload-artifact@v4
