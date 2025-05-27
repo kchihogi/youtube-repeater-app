@@ -104,15 +104,22 @@ def create_desktop_shortcut():
         shortcut_path = os.path.join(desktop, 'YouTubeRepeater.lnk')
         if os.path.exists(shortcut_path):
             return True
-        target = sys.executable
+        
+        # pythonw.exeのパスを取得（コンソールウィンドウなしで実行）
+        python_dir = os.path.dirname(sys.executable)
+        pythonw_exe = os.path.join(python_dir, 'pythonw.exe')
+        if not os.path.exists(pythonw_exe):
+            # pythonw.exeが見つからない場合は通常のpythonを使用
+            pythonw_exe = sys.executable
+            
         script = os.path.abspath(__file__)
         icon = os.path.join(os.path.dirname(script), 'app.ico')
         shell = Dispatch('WScript.Shell')
         shortcut = shell.CreateShortcut(shortcut_path)
-        shortcut.TargetPath = target
+        shortcut.TargetPath = pythonw_exe  # pythonw.exeを使用
         shortcut.Arguments = f'"{script}"'
         shortcut.WorkingDirectory = os.path.dirname(script)
-        shortcut.IconLocation = icon if os.path.exists(icon) else target
+        shortcut.IconLocation = icon if os.path.exists(icon) else pythonw_exe
         shortcut.Save()
         return True
     except Exception as e:
